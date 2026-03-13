@@ -46,7 +46,7 @@ public:
   void setBacklight(uint8_t level) override;
 
 private:
-  static constexpr size_t QUEUED_TX_DEPTH = 2u;
+  static constexpr size_t QUEUED_TX_DEPTH = 4u;
 
   Config config_;
   uint32_t spiHz_ = 0;
