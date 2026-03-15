@@ -108,7 +108,7 @@ void SPIESP32DisplayBus::writePixels565(const uint16_t* pixels, size_t count) {
   if (!pixels || count == 0u) {
     return;
   }
-  spi().writePixels(pixels, (uint32_t)(count * sizeof(uint16_t)));
+  spi().writePixels(pixels, count * sizeof(uint16_t));
 }
 
 void SPIESP32DisplayBus::setBacklight(uint8_t level) {
@@ -119,10 +119,10 @@ void SPIESP32DisplayBus::setBacklight(uint8_t level) {
     return;
   }
 
-  uint8_t effectiveLevel = BACKLIGHT_ACTIVE_LOW ? (uint8_t)(DISPLAY_LEVEL_MAX - level) : level;
-  uint32_t duty = ((uint32_t)effectiveLevel * BACKLIGHT_PWM_LEVEL_MAX +
+  uint8_t effectiveLevel = BACKLIGHT_ACTIVE_LOW ? (DISPLAY_LEVEL_MAX - level) : level;
+  uint32_t duty = (effectiveLevel * BACKLIGHT_PWM_LEVEL_MAX +
                    (DISPLAY_LEVEL_MAX / 2u)) / DISPLAY_LEVEL_MAX;
-  ledcWrite((uint8_t)config_.ledPin, duty);
+  ledcWrite(config_.ledPin, duty);
 }
 
 void SPIESP32DisplayBus::beginTransaction() {
@@ -145,7 +145,7 @@ void SPIESP32DisplayBus::transfer(const uint8_t* bytes, size_t size) {
   if (!bytes || size == 0) {
     return;
   }
-  spi().writeBytes(bytes, (uint32_t)size);
+  spi().writeBytes(bytes, size);
 }
 
 bool SPIESP32DisplayBus::ensureBacklightPwmConfigured() {
@@ -156,7 +156,7 @@ bool SPIESP32DisplayBus::ensureBacklightPwmConfigured() {
     return true;
   }
   if (!ledcAttach(
-        (uint8_t)config_.ledPin,
+        config_.ledPin,
         BACKLIGHT_PWM_FREQ_HZ,
         BACKLIGHT_PWM_RESOLUTION_BITS)) {
     return false;

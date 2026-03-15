@@ -126,7 +126,7 @@ void SPIESP32DisplayBusDMA::queueWritePixels565(const uint16_t* pixels, size_t c
     return;
   }
 
-  const uint8_t* bytes = reinterpret_cast<const uint8_t*>(pixels);
+  const uint8_t* bytes = static_cast<const uint8_t*>(static_cast<const void*>(pixels));
   size_t remaining = count * sizeof(uint16_t);
   while (remaining > 0u) {
     size_t chunk = remaining;
@@ -160,10 +160,10 @@ void SPIESP32DisplayBusDMA::setBacklight(uint8_t level) {
     return;
   }
 
-  uint8_t effectiveLevel = BACKLIGHT_ACTIVE_LOW ? (uint8_t)(DISPLAY_LEVEL_MAX - level) : level;
-  uint32_t duty = ((uint32_t)effectiveLevel * BACKLIGHT_PWM_LEVEL_MAX +
+  uint8_t effectiveLevel = BACKLIGHT_ACTIVE_LOW ? (DISPLAY_LEVEL_MAX - level) : level;
+  uint32_t duty = (effectiveLevel * BACKLIGHT_PWM_LEVEL_MAX +
                    (DISPLAY_LEVEL_MAX / 2u)) / DISPLAY_LEVEL_MAX;
-  ledcWrite((uint8_t)config_.ledPin, duty);
+  ledcWrite(config_.ledPin, duty);
 }
 
 spi_host_device_t SPIESP32DisplayBusDMA::resolveHost() const {
@@ -201,7 +201,7 @@ bool SPIESP32DisplayBusDMA::initBus() {
   }
 
   spi_device_interface_config_t devcfg = {};
-  devcfg.clock_speed_hz = static_cast<int>(spiHz_);
+  devcfg.clock_speed_hz = spiHz_;
   devcfg.mode = config_.dataMode;
   devcfg.spics_io_num = -1;
   devcfg.queue_size = 4;
@@ -302,7 +302,7 @@ bool SPIESP32DisplayBusDMA::ensureBacklightPwmConfigured() {
     return true;
   }
   if (!ledcAttach(
-        (uint8_t)config_.ledPin,
+        config_.ledPin,
         BACKLIGHT_PWM_FREQ_HZ,
         BACKLIGHT_PWM_RESOLUTION_BITS)) {
     return false;
