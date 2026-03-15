@@ -56,10 +56,24 @@ bool ESP32DacAudioOutput::begin() {
     return false;
   }
   memset(writeBuffer, 128, sizeof(writeBuffer));
-  memset(sampleBuffer, 0, sizeof(sampleBuffer));
+  memset(pcmRing, 0, sizeof(pcmRing));
+  memset(pcmHasSignal, 0, sizeof(pcmHasSignal));
+  for (uint8_t i = 0u; i < PCM_RING_CHUNKS; ++i) {
+    pcmFirstSignal[i] = AUDIO_CHUNK_SIZE;
+  }
   outputEnabled = false;
   silenceSamples = 0u;
   lastSample = 0;
+  nextChunkUs = micros();
+  ringRead = 0u;
+  ringWrite = 0u;
+  ringCount = 0u;
+#if SGF_ESP32_DAC_AUTO_MUTE
+  gateGain = 0u;
+  gateGainTarget = 0u;
+  gateFadeInStep = GATE_GAIN_MAX;
+  gateFadeOutStep = GATE_GAIN_MAX;
+#endif
 
   running = true;
   TaskHandle_t handle = nullptr;
@@ -116,6 +130,7 @@ void ESP32DacAudioOutput::audioTaskThunk(void* arg) {
 }
 
 void ESP32DacAudioOutput::audioTaskLoop() {
+#if SGF_ESP32_DAC_AUTO_MUTE
   const uint32_t sampleRate = source.sampleRate();
   const uint32_t holdSamples =
     (sampleRate * 1ull * SGF_ESP32_DAC_SILENCE_HOLD_MS) / 1000u;
@@ -123,68 +138,31 @@ void ESP32DacAudioOutput::audioTaskLoop() {
     (sampleRate * 1ull * SGF_ESP32_DAC_FADE_OUT_MS) / 1000u;
   const uint32_t fadeInSamplesTotal =
     (sampleRate * 1ull * SGF_ESP32_DAC_FADE_IN_MS) / 1000u;
-  const TickType_t silentDelayTicks = pdMS_TO_TICKS(
-    ((AUDIO_CHUNK_SIZE * 1000ull) + sampleRate - 1u) / sampleRate);
+  gateFadeInStep =
+    fadeInSamplesTotal > 0u ? (GATE_GAIN_MAX + fadeInSamplesTotal - 1u) / fadeInSamplesTotal : GATE_GAIN_MAX;
+  gateFadeOutStep =
+    fadeOutSamplesTotal > 0u ? (GATE_GAIN_MAX + fadeOutSamplesTotal - 1u) / fadeOutSamplesTotal : GATE_GAIN_MAX;
+#endif
+  const uint32_t chunkUs =
+    (AUDIO_CHUNK_SIZE * 1000000ull + source.sampleRate() - 1u) / source.sampleRate();
   while (running && dacHandle != nullptr) {
-    bool hasSignal = false;
-    for (size_t i = 0; i < AUDIO_CHUNK_SIZE; ++i) {
-      const int16_t sample = source.renderSample();
-      sampleBuffer[i] = sample;
-      if (sample > SGF_ESP32_DAC_SILENCE_THRESHOLD ||
-          sample < -SGF_ESP32_DAC_SILENCE_THRESHOLD) {
-        hasSignal = true;
-      }
+    const uint32_t nowUs = micros();
+    while (ringCount < PCM_RING_CHUNKS && (int32_t)(nowUs - nextChunkUs) >= 0) {
+      uint8_t hasSignal = 0u;
+      uint16_t firstSignal = AUDIO_CHUNK_SIZE;
+      produceChunk(pcmRing[ringWrite], &hasSignal, &firstSignal);
+      pcmHasSignal[ringWrite] = hasSignal;
+      pcmFirstSignal[ringWrite] = firstSignal;
+      ringWrite = (ringWrite + 1u) % PCM_RING_CHUNKS;
+      ++ringCount;
+      nextChunkUs += chunkUs;
     }
 
-    if (!hasSignal) {
-      if (outputEnabled && silenceSamples == 0u && fadeOutSamplesTotal > 0u) {
-        const uint32_t fadeCount =
-          fadeOutSamplesTotal < AUDIO_CHUNK_SIZE ? fadeOutSamplesTotal : AUDIO_CHUNK_SIZE;
-        const int32_t fadeDen = fadeCount;
-        for (size_t i = 0; i < AUDIO_CHUNK_SIZE; ++i) {
-          const int32_t numerator = i < fadeCount ? fadeDen - i : 0;
-          const int16_t faded = numerator > 0 ? (lastSample * numerator) / fadeDen : 0;
-          writeBuffer[i] = sampleToDac(faded);
-        }
-        lastSample = 0;
-      } else {
-        memset(writeBuffer, 128, sizeof(writeBuffer));
-      }
-      silenceSamples += AUDIO_CHUNK_SIZE;
-      if (outputEnabled) {
+    if (ringCount == 0u) {
 #if SGF_ENABLE_AUDIO_PROFILER
-        const uint32_t fillStartUs = micros();
-#endif
-        size_t bytesLoaded = 0u;
-        const esp_err_t err = dac_continuous_write(
-          dacHandle,
-          writeBuffer,
-          sizeof(writeBuffer),
-          &bytesLoaded,
-          20);
-#if SGF_ENABLE_AUDIO_PROFILER
-        audioProfiler.increment(FillCallsSlot);
-        audioProfiler.probe(FillTimeSlot, micros() - fillStartUs);
-        const uint32_t bufferedUs = (bytesLoaded * 1000000ull) / sampleRate;
-        audioProfiler.probe(RingUsedSlot, bufferedUs);
-#endif
-        if (err == ESP_ERR_TIMEOUT) {
-          overrunCount++;
-        } else if (err != ESP_OK || bytesLoaded < sizeof(writeBuffer)) {
-          underrunCount++;
-        }
-      } else {
-#if SGF_ENABLE_AUDIO_PROFILER
-        audioProfiler.increment(FillCallsSlot);
-        audioProfiler.probe(FillTimeSlot, 0u);
-        audioProfiler.probe(RingUsedSlot, 0u);
-#endif
-      }
-
-      if (outputEnabled && silenceSamples >= holdSamples) {
-        disableOutput();
-      }
-#if SGF_ENABLE_AUDIO_PROFILER
+      audioProfiler.increment(FillCallsSlot);
+      audioProfiler.probe(FillTimeSlot, 0u);
+      audioProfiler.probe(RingUsedSlot, 0u);
       if (underrunCount > 0u) {
         audioProfiler.increment(UnderrunSlot, underrunCount);
         underrunCount = 0u;
@@ -194,57 +172,112 @@ void ESP32DacAudioOutput::audioTaskLoop() {
         overrunCount = 0u;
       }
 #endif
-      vTaskDelay(silentDelayTicks > 0 ? silentDelayTicks : 1);
-      continue;
-    }
-
-    silenceSamples = 0u;
-    const bool wasMuted = !outputEnabled;
-    if (wasMuted && !enableOutput()) {
-      overrunCount++;
       vTaskDelay(1);
       continue;
     }
 
-    if (wasMuted && fadeInSamplesTotal > 0u) {
-      const uint32_t fadeCount =
-        fadeInSamplesTotal < AUDIO_CHUNK_SIZE ? fadeInSamplesTotal : AUDIO_CHUNK_SIZE;
-      const int32_t fadeDen = fadeCount;
-      for (size_t i = 0; i < AUDIO_CHUNK_SIZE; ++i) {
-        int32_t sample = sampleBuffer[i];
-        if (i < fadeCount) {
-          sample = (sample * (i + 1u)) / fadeDen;
-        }
-        writeBuffer[i] = sampleToDac(sample);
+    if (ringCount < 2u) {
+#if SGF_ENABLE_AUDIO_PROFILER
+      audioProfiler.increment(FillCallsSlot);
+      audioProfiler.probe(FillTimeSlot, 0u);
+      audioProfiler.probe(RingUsedSlot, 0u);
+      if (underrunCount > 0u) {
+        audioProfiler.increment(UnderrunSlot, underrunCount);
+        underrunCount = 0u;
+      }
+      if (overrunCount > 0u) {
+        audioProfiler.increment(OverrunSlot, overrunCount);
+        overrunCount = 0u;
+      }
+#endif
+      vTaskDelay(1);
+      continue;
+    }
+
+    int16_t* chunk = pcmRing[ringRead];
+    const bool hasSignal = pcmHasSignal[ringRead] != 0u;
+    const uint8_t nextIndex = (ringRead + 1u) % PCM_RING_CHUNKS;
+    const bool nextHasSignal = pcmHasSignal[nextIndex] != 0u;
+
+#if SGF_ESP32_DAC_AUTO_MUTE
+    if (hasSignal) {
+      silenceSamples = 0u;
+      gateGainTarget = GATE_GAIN_MAX;
+    } else if (nextHasSignal) {
+      silenceSamples = 0u;
+      if (gateGain > 0u) {
+        gateGainTarget = GATE_GAIN_MAX;
       }
     } else {
-      for (size_t i = 0; i < AUDIO_CHUNK_SIZE; ++i) {
-        writeBuffer[i] = sampleToDac(sampleBuffer[i]);
+      silenceSamples += AUDIO_CHUNK_SIZE;
+      gateGainTarget = silenceSamples >= holdSamples ? 0u : GATE_GAIN_MAX;
+    }
+#endif
+    for (size_t i = 0; i < AUDIO_CHUNK_SIZE; ++i) {
+      int16_t outSample = chunk[i];
+#if SGF_ESP32_DAC_AUTO_MUTE
+      if (gateGain < gateGainTarget) {
+        gateGain += gateFadeInStep;
+        if (gateGain > gateGainTarget) {
+          gateGain = gateGainTarget;
+        }
+      } else if (gateGain > gateGainTarget) {
+        gateGain = gateGain > gateFadeOutStep ? gateGain - gateFadeOutStep : 0u;
+        if (gateGain < gateGainTarget) {
+          gateGain = gateGainTarget;
+        }
+      }
+      outSample = (outSample * gateGain) / GATE_GAIN_MAX;
+#endif
+      writeBuffer[i] = sampleToDac(outSample);
+      lastSample = outSample;
+    }
+
+    bool shouldWrite = true;
+#if SGF_ESP32_DAC_AUTO_MUTE
+    if (gateGain == 0u && gateGainTarget == 0u && !hasSignal && !nextHasSignal) {
+      shouldWrite = false;
+      disableOutput();
+    }
+#endif
+
+    if (shouldWrite && !outputEnabled) {
+      if (!enableOutput()) {
+        overrunCount++;
+        vTaskDelay(1);
+        continue;
       }
     }
-    lastSample = sampleBuffer[AUDIO_CHUNK_SIZE - 1];
 
 #if SGF_ENABLE_AUDIO_PROFILER
     const uint32_t fillStartUs = micros();
 #endif
     size_t bytesLoaded = 0u;
-    const esp_err_t err = dac_continuous_write(
-      dacHandle,
-      writeBuffer,
-      sizeof(writeBuffer),
-      &bytesLoaded,
-      20);
+    esp_err_t err = ESP_OK;
+    if (shouldWrite) {
+      err = dac_continuous_write(
+        dacHandle,
+        writeBuffer,
+        sizeof(writeBuffer),
+        &bytesLoaded,
+        20);
+    }
 #if SGF_ENABLE_AUDIO_PROFILER
     audioProfiler.increment(FillCallsSlot);
     audioProfiler.probe(FillTimeSlot, micros() - fillStartUs);
     const uint32_t bufferedUs = (bytesLoaded * 1000000ull) / source.sampleRate();
     audioProfiler.probe(RingUsedSlot, bufferedUs);
 #endif
-    if (err == ESP_ERR_TIMEOUT) {
+    if (!shouldWrite) {
+      bytesLoaded = sizeof(writeBuffer);
+    } else if (err == ESP_ERR_TIMEOUT) {
       overrunCount++;
     } else if (err != ESP_OK || bytesLoaded < sizeof(writeBuffer)) {
       underrunCount++;
     }
+
+    ringRead = (ringRead + 1u) % PCM_RING_CHUNKS;
+    --ringCount;
 #if SGF_ENABLE_AUDIO_PROFILER
     if (underrunCount > 0u) {
       audioProfiler.increment(UnderrunSlot, underrunCount);
@@ -295,6 +328,31 @@ dac_channel_mask_t ESP32DacAudioOutput::channelMask() const {
 
 uint8_t ESP32DacAudioOutput::sampleToDac(int16_t sample) {
   return (sample + 32768) >> 8;
+}
+
+bool ESP32DacAudioOutput::produceChunk(int16_t* chunk, uint8_t* hasSignalOut, uint16_t* firstSignalOut) {
+  if (chunk == nullptr || hasSignalOut == nullptr || firstSignalOut == nullptr) {
+    return false;
+  }
+  uint8_t hasSignal = 0u;
+  uint16_t firstSignal = AUDIO_CHUNK_SIZE;
+  for (size_t i = 0; i < AUDIO_CHUNK_SIZE; ++i) {
+    source.advanceSamples(1u);
+    const int16_t sample = source.renderSample();
+    chunk[i] = sample;
+#if SGF_ESP32_DAC_AUTO_MUTE
+    if (sample > SGF_ESP32_DAC_SILENCE_THRESHOLD ||
+        sample < -SGF_ESP32_DAC_SILENCE_THRESHOLD) {
+      hasSignal = 1u;
+      if (firstSignal == AUDIO_CHUNK_SIZE) {
+        firstSignal = i;
+      }
+    }
+#endif
+  }
+  *hasSignalOut = hasSignal;
+  *firstSignalOut = firstSignal;
+  return true;
 }
 
 }  // namespace SGFAudio
